@@ -29,11 +29,17 @@ import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 import cuda.bindings.driver as cuda_drv
 import torch
+import tvm_ffi
 from cutlass import Int32
 from cutlass.base_dsl.compiler import GenerateLineInfo  # profiling
 from ..jit.mamba.seq_chunk_cumsum import gen_seq_chunk_cumsum_module
 from ..triton.kernels.ssd_chunk_state import chunk_cumsum_fwd
 from .ssd_kernel import SSDKernel
+
+
+# Feature-detection sentinel for serving-framework integrations.  Increment
+# only when the packed-varlen state/output contract changes incompatibly.
+SSD_COMBINED_VARLEN_STATE_API_VERSION = 2
 
 
 @functools.cache
@@ -52,8 +58,11 @@ def _get_compiled_ssd_kernel(
     has_init_states: bool,
     has_varlen: bool,
     has_z: bool,
+    has_intermediate_states: bool,
+    output_token_major: bool,
     io_dtype,
     state_dtype,
+    delta_dtype,
     seq_idx_dtype,
     cumsum_dtype,
     acc_dtype,
@@ -74,8 +83,11 @@ def _get_compiled_ssd_kernel(
         has_init_states,
         has_varlen,
         has_z,
+        has_intermediate_states,
+        output_token_major,
         io_dtype=io_dtype,
         state_dtype=state_dtype,
+        delta_dtype=delta_dtype,
         seq_idx_dtype=seq_idx_dtype,
         cumsum_delta_dtype=cumsum_dtype,
         acc_dtype=acc_dtype,
@@ -114,7 +126,7 @@ def _get_compiled_ssd_kernel(
 
     # delta: (L, C, EH, B) — L stride 1 (same layout as cumsum_delta)
     delta_fake = cute.runtime.make_fake_compact_tensor(
-        io_dtype,
+        delta_dtype,
         (L, sym_C, sym_EH, sym_B),
         stride_order=(0, 1, 2, 3),
         assumed_align=16,
@@ -136,24 +148,29 @@ def _get_compiled_ssd_kernel(
         assumed_align=16,
     )
 
-    # y: (L, D, C, EH, B) — L stride 1 (from permute (4,2,3,1,0) of 5D)
+    # y: (L, D, C, EH, B).  The legacy chunk-major output has L stride 1;
+    # token-major output has D stride 1 and can be consumed directly by the
+    # following projection/norm without a transpose-copy.
     y_fake = cute.runtime.make_fake_compact_tensor(
         io_dtype,
         (L, D, sym_C, sym_EH, sym_B),
-        stride_order=(0, 2, 1, 3, 4),
+        stride_order=(2, 0, 3, 1, 4) if output_token_major else (0, 2, 1, 3, 4),
         assumed_align=16,
     )
 
-    # init_states and fstate use a separate batch sym because in varlen mode
-    # init_states has num_seqs as batch dim (not the packed batch dim of x).
-    sym_state_B = cute.sym_int()
+    # State tensors use dimensions independent of the packed input batch.  Keep
+    # input and output symbols separate because final stores can be suppressed,
+    # in which case fstate is only a one-row descriptor dummy while
+    # initial_states still contains every sequence.
+    sym_init_state_B = cute.sym_int()
+    sym_final_state_B = cute.sym_int()
 
     # init_states: (N, D, EH, state_B) — N stride 1 (from permute (3,2,1,0) of 4D)
     init_states_fake = None
     if has_init_states:
         init_states_fake = cute.runtime.make_fake_compact_tensor(
             state_dtype,
-            (N, D, sym_EH, sym_state_B),
+            (N, D, sym_EH, sym_init_state_B),
             stride_order=(0, 1, 2, 3),
             assumed_align=16,
         )
@@ -161,10 +178,30 @@ def _get_compiled_ssd_kernel(
     # fstate: (N, D, EH, state_B) — N stride 1 (same layout as init_states)
     fstate_fake = cute.runtime.make_fake_compact_tensor(
         state_dtype,
-        (N, D, sym_EH, sym_state_B),
+        (N, D, sym_EH, sym_final_state_B),
         stride_order=(0, 1, 2, 3),
         assumed_align=16,
     )
+
+    intermediate_states_fake = None
+    intermediate_state_indices_fake = None
+    if has_intermediate_states:
+        sym_num_state_slots = cute.sym_int()
+        # Serving caches commonly place each SSM row inside a larger unified
+        # page.  Inner N/D/head modes remain compact, while the cache-row
+        # stride is runtime-dynamic (and can exceed the logical row size).
+        intermediate_states_fake = cute.runtime.make_fake_tensor(
+            state_dtype,
+            (N, D, sym_EH, sym_num_state_slots),
+            stride=(1, N, D * N, cute.sym_int()),
+            assumed_align=16,
+        )
+        sym_nlc = cute.sym_int()
+        intermediate_state_indices_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (sym_nlc,),
+            assumed_align=4,
+        )
 
     # D tensor: (D_dim, EH) — D_dim stride 1 (from permute (1,0) of 2D)
     d_fake = None
@@ -231,6 +268,8 @@ def _get_compiled_ssd_kernel(
         y_fake,
         init_states_fake,
         fstate_fake,
+        intermediate_states_fake,
+        intermediate_state_indices_fake,
         d_fake,
         z_fake,
         seq_idx_fake,
@@ -239,6 +278,9 @@ def _get_compiled_ssd_kernel(
         seq_chunk_cumsum_fake,
         Int32(0),  # num_logical_chunks (dummy, runtime value)
         Int32(0),  # num_seqs (dummy, runtime value)
+        Int32(0),  # valid_seqlen (dummy, runtime value)
+        Int32(0),  # num_intermediate_state_slots (dummy, runtime value)
+        Int32(1),  # write_final_states (dummy, runtime value)
         max_active_clusters,
         stream_fake,
         options="--enable-tvm-ffi",
@@ -254,17 +296,27 @@ class SSDCombined:
     to minimize host-side overhead on repeated calls.
 
     Dtype expectations (no runtime conversions — assert on mismatch):
-        io_dtype (bf16):  x, B, C, z, D, out, dt_processed
+        io_dtype (bf16):  x, B, C, z, D, out
         state_dtype (bf16): initial_states, final_states
         fp32 always:      A, dA_cumsum
         any (bf16/fp32):  dt, dt_bias (consumed by Triton cumsum preprocessor)
+        dt_processed_dtype (bf16/fp32): processed dt consumed by the SSD kernel
 
     Usage::
 
         ssd = SSDCombined(chunk_size=128, nheads=8, headdim=64,
                           dstate=128, ngroups=8)
         out, final_states = ssd.run(x, dt, A, B, C, D=D, dt_bias=dt_bias, ...)
+
+    For packed serving workloads, ``has_intermediate_states=True`` enables
+    sparse post-segment state stores into a caller-owned cache.  Pair it with
+    ``output_token_major=True`` to write the output directly in contiguous
+    ``(batch, seqlen, nheads, headdim)`` order.
     """
+
+    varlen_state_api_version = SSD_COMBINED_VARLEN_STATE_API_VERSION
+    supports_strided_intermediate_states = True
+    supports_fp32_processed_dt = True
 
     def __init__(
         self,
@@ -281,8 +333,21 @@ class SSDCombined:
         has_varlen: bool = False,
         has_z: bool = False,
         seq_idx_dtype=torch.int64,
+        has_intermediate_states: bool = False,
+        output_token_major: bool = False,
+        dt_processed_dtype: torch.dtype = torch.bfloat16,
+        cumsum_block_size_h: Optional[int] = None,
     ):
         from ..utils import get_compute_capability
+
+        if cumsum_block_size_h is not None and (
+            type(cumsum_block_size_h) is not int
+            or cumsum_block_size_h not in (1, 2, 4, 8, 16, 32, 64)
+        ):
+            raise ValueError(
+                "cumsum_block_size_h must be one of "
+                f"(1, 2, 4, 8, 16, 32, 64), got {cumsum_block_size_h}"
+            )
 
         major, minor = get_compute_capability(torch.device("cuda"))
         # The SSD CuTe-DSL kernel uses tcgen05 MMA (MmaF16BF16Op), which is only
@@ -305,7 +370,11 @@ class SSDCombined:
         self._has_init_states = has_initial_states
         self._has_varlen = has_varlen
         self._has_z = has_z
+        self._has_intermediate_states = has_intermediate_states
+        self._output_token_major = output_token_major
         self._state_torch_dtype = state_dtype
+        self._dt_processed_torch_dtype = dt_processed_dtype
+        self._cumsum_block_size_h = cumsum_block_size_h
 
         # Resolve dtypes
         assert io_dtype == torch.bfloat16, f"io_dtype must be bfloat16, got {io_dtype}"
@@ -319,6 +388,15 @@ class SSDCombined:
             f"state_dtype must be one of {list(_state_dtype_map.keys())}, got {state_dtype}"
         )
         self._state_dtype = _state_dtype_map[state_dtype]
+        _delta_dtype_map = {
+            torch.bfloat16: cutlass.BFloat16,
+            torch.float32: cutlass.Float32,
+        }
+        assert dt_processed_dtype in _delta_dtype_map, (
+            "dt_processed_dtype must be torch.bfloat16 or torch.float32, "
+            f"got {dt_processed_dtype}"
+        )
+        self._delta_dtype = _delta_dtype_map[dt_processed_dtype]
         self._cumsum_dtype = cutlass.Float32
         self._acc_dtype = cutlass.Float32
         self._io_torch_dtype = cutlass_torch.dtype(self._io_dtype)
@@ -351,8 +429,11 @@ class SSDCombined:
             has_initial_states,
             has_varlen,
             has_z,
+            has_intermediate_states,
+            output_token_major,
             self._io_dtype,
             self._state_dtype,
+            self._delta_dtype,
             self._seq_idx_cutlass_dtype,
             self._cumsum_dtype,
             self._acc_dtype,
@@ -474,6 +555,11 @@ class SSDCombined:
         update_seq_chunk_cumsum: bool = False,
         out: Optional[torch.Tensor] = None,
         return_final_states: bool = True,
+        num_seqs: Optional[int] = None,
+        valid_seqlen: Optional[int] = None,
+        intermediate_state_indices: Optional[torch.Tensor] = None,
+        intermediate_states: Optional[torch.Tensor] = None,
+        final_states: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run SSD combined forward pass.
 
@@ -488,6 +574,39 @@ class SSDCombined:
                 If None, an internal buffer is allocated and computed.
             update_seq_chunk_cumsum: If True, (re)compute seq_chunk_cumsum into
                 the provided tensor.  Defaults to False.
+            num_seqs: Explicit number of original sequences in packed varlen
+                mode.  This is required when neither ``initial_states`` nor a
+                precomputed ``seq_chunk_cumsum`` supplies the count.
+            valid_seqlen: Number of real tokens in a physically padded input.
+                The physical ``x.shape[1]`` must remain chunk aligned.  Tokens
+                in ``[valid_seqlen, x.shape[1])`` are excluded from state math
+                and output stores.  A short final chunk is supported only in
+                packed varlen mode.  The caller must keep padded ``x``, ``dt``,
+                ``B``, and ``C`` values finite (zero-fill is recommended): the
+                fused kernel compute-masks the tail after tensor-core loads, so
+                NaN or Inf padding can contaminate otherwise valid results.
+            intermediate_state_indices: Optional int32 tensor with one entry
+                per logical segment.  A nonnegative value is the destination
+                row in ``intermediate_states`` for that segment's post-update
+                state; ``-1`` skips the store.  Destinations need not be dense,
+                which allows writing directly into a serving cache.  The caller
+                must not assign the same destination to segments processed by
+                different sequences because those writes would race.  A state
+                can be captured only at a logical-segment endpoint, so callers
+                must split metadata at sequence boundaries, physical chunk
+                boundaries, and every requested cache/checkpoint boundary.
+            intermediate_states: Caller-owned state destination of shape
+                ``(num_slots, nheads, headdim, dstate)``.  Inner dimensions
+                must be compact, but the row stride may be larger than the
+                logical row, allowing a view into padded unified cache pages.
+                The destination may be larger than the number of selected
+                segments.
+            final_states: Optional caller-owned contiguous final-state output.
+                When omitted, the legacy internal reusable buffer is used.
+                Setting ``return_final_states=False`` and omitting this buffer
+                suppresses final-state stores; selected intermediate stores can
+                include every sequence final without materializing a separate
+                ``num_seqs``-sized tensor.
         """
         chunk_size = self.chunk_size
 
@@ -495,12 +614,44 @@ class SSDCombined:
         _, _, ngroups, dstate = B.shape
         nchunks = seqlen // chunk_size
 
+        if self._has_varlen and batch != 1:
+            raise ValueError(
+                "packed varlen SSDCombined requires batch=1 because logical "
+                "sequences are encoded in seq_idx"
+            )
+        if self._has_intermediate_states and not self._has_varlen and batch > 1:
+            raise ValueError(
+                "selected intermediate state stores with non-varlen batch > 1 "
+                "are unsupported because the 1D destination map would be shared "
+                "across batch CTAs; use packed varlen metadata or batch=1"
+            )
+
+        if valid_seqlen is None:
+            valid_seqlen = seqlen
+        if not isinstance(valid_seqlen, int):
+            raise TypeError(f"valid_seqlen must be an int, got {type(valid_seqlen)}")
+        if valid_seqlen <= 0 or valid_seqlen > seqlen:
+            raise ValueError(
+                f"valid_seqlen must be in [1, {seqlen}], got {valid_seqlen}"
+            )
+        if valid_seqlen != seqlen and (not self._has_varlen or batch != 1):
+            raise ValueError(
+                "a padded short final chunk is supported only for packed varlen "
+                "inputs with batch=1"
+            )
+
         assert seqlen % chunk_size == 0, (
             f"seqlen ({seqlen}) must be divisible by chunk_size ({chunk_size})"
         )
 
         # A is always fp32
         assert A.dtype == torch.float32, f"A must be float32, got {A.dtype}"
+
+        if self._has_init_states != (initial_states is not None):
+            raise ValueError(
+                "initial_states presence must match "
+                "SSDCombined(has_initial_states=...)"
+            )
 
         # Validate varlen arguments
         if seq_idx is not None:
@@ -530,21 +681,30 @@ class SSDCombined:
                 f"chunk_indices and chunk_offsets must have the same shape, "
                 f"got {chunk_indices.shape} vs {chunk_offsets.shape}"
             )
+        if seq_chunk_cumsum is not None:
+            if seq_chunk_cumsum.dim() != 1 or seq_chunk_cumsum.dtype != torch.int32:
+                raise ValueError("seq_chunk_cumsum must be a 1D int32 tensor")
 
         if out is not None:
-            assert out.shape == (batch, nheads, headdim, nchunks, chunk_size), (
-                f"out shape {out.shape} doesn't match "
-                f"expected ({batch}, {nheads}, {headdim}, {nchunks}, {chunk_size})"
+            expected_out_shape = (
+                (batch, seqlen, nheads, headdim)
+                if self._output_token_major
+                else (batch, nheads, headdim, nchunks, chunk_size)
+            )
+            assert out.shape == expected_out_shape, (
+                f"out shape {out.shape} doesn't match expected {expected_out_shape}"
             )
             assert out.dtype == x.dtype, (
                 f"out dtype {out.dtype} doesn't match x dtype {x.dtype}"
             )
-            assert out.is_contiguous(), (
-                "out must be contiguous in (B, EH, D, C, L) layout"
-            )
+            assert out.is_contiguous(), "out must be contiguous"
+            if out.device != x.device:
+                raise ValueError("out must be on the same device as x")
 
-        # Triton kernel outputs dt_processed directly in io_dtype (bf16),
-        # avoiding a separate float32->bf16 copy.
+        # The serving path keeps processed dt in FP32 to match vLLM's Triton
+        # recurrence and its FP16 cache checkpoints.  Legacy callers retain
+        # the BF16 default to avoid changing their numerical/performance
+        # contract.
         dA_cumsum, dt_processed = chunk_cumsum_fwd(
             dt,
             A,
@@ -552,19 +712,31 @@ class SSDCombined:
             dt_bias=dt_bias,
             dt_softplus=dt_softplus,
             dt_limit=dt_limit,
-            dt_out_dtype=self._io_torch_dtype,
+            dt_out_dtype=self._dt_processed_torch_dtype,
+            valid_seqlen=valid_seqlen,
+            cumsum_block_size_h=self._cumsum_block_size_h,
         )
 
         if out is None:
-            out = torch.empty(
-                batch,
-                nheads,
-                headdim,
-                nchunks,
-                chunk_size,
-                dtype=x.dtype,
-                device=x.device,
-            )
+            if self._output_token_major:
+                out = torch.empty(
+                    batch,
+                    seqlen,
+                    nheads,
+                    headdim,
+                    dtype=x.dtype,
+                    device=x.device,
+                )
+            else:
+                out = torch.empty(
+                    batch,
+                    nheads,
+                    headdim,
+                    nchunks,
+                    chunk_size,
+                    dtype=x.dtype,
+                    device=x.device,
+                )
 
         io_torch_dtype = self._io_torch_dtype
 
@@ -633,38 +805,90 @@ class SSDCombined:
         # init_states: (B, EH, D, N) -> (N, D, EH, B)
         init_states_permuted = None
         if self._has_init_states and initial_states is not None:
+            expected_initial_shape = (batch, nheads, headdim, dstate)
+            if self._has_varlen:
+                # The sequence dimension is checked against num_seqs below.
+                expected_initial_shape = (
+                    initial_states.shape[0],
+                    nheads,
+                    headdim,
+                    dstate,
+                )
+            if initial_states.shape != expected_initial_shape:
+                raise ValueError(
+                    f"initial_states shape {initial_states.shape} doesn't match "
+                    f"expected {expected_initial_shape}"
+                )
             assert initial_states.dtype == self._state_torch_dtype, (
                 f"init_states dtype {initial_states.dtype} doesn't match "
                 f"state_dtype {self._state_torch_dtype}"
             )
+            if not initial_states.is_contiguous():
+                raise ValueError("initial_states must be contiguous")
+            if initial_states.device != x.device:
+                raise ValueError("initial_states must be on the same device as x")
             init_states_permuted = initial_states.permute(3, 2, 1, 0)
 
-        # out: (B, EH, D, C, L) -> (L, D, C, EH, B)
+        # out -> kernel layout (L, D, C, EH, B).  Token-major output keeps D
+        # contiguous, whereas the legacy layout keeps L contiguous.
         assert out.dtype == io_torch_dtype, (
             f"out dtype {out.dtype} doesn't match {io_torch_dtype}"
         )
-        y_permuted = out.permute(4, 2, 3, 1, 0)
-
-        # fstate: allocate (B, EH, D, N), pass permuted (N, D, EH, B) to kernel
-        fstate_batch = initial_states.shape[0] if initial_states is not None else batch
-        fstate_torch = self._get_or_alloc_fstate(fstate_batch)
-        fstate_permuted = fstate_torch.permute(3, 2, 1, 0)
+        if self._output_token_major:
+            y_permuted = out.reshape(
+                batch, nchunks, chunk_size, nheads, headdim
+            ).permute(2, 4, 1, 3, 0)
+        else:
+            y_permuted = out.permute(4, 2, 3, 1, 0)
 
         # Varlen metadata: seq_chunk_cumsum maps sequence IDs to logical chunk ranges.
         # It can be pre-computed by the caller via compute_seq_chunk_cumsum().
-        num_seqs = 0
+        has_varlen_metadata = all(
+            value is not None
+            for value in (seq_idx, chunk_indices, chunk_offsets)
+        )
+        if any(
+            value is not None
+            for value in (seq_idx, chunk_indices, chunk_offsets)
+        ) and not has_varlen_metadata:
+            raise ValueError(
+                "seq_idx, chunk_indices, and chunk_offsets must be provided together"
+            )
+        if has_varlen_metadata != self._has_varlen:
+            raise ValueError(
+                "varlen metadata presence must match SSDCombined(has_varlen=...)"
+            )
 
-        if (
-            seq_idx is not None
-            and chunk_indices is not None
-            and chunk_offsets is not None
-        ):
-            if initial_states is None:
+        kernel_num_seqs = 0
+        if has_varlen_metadata:
+            inferred_num_seqs = None
+            if initial_states is not None:
+                inferred_num_seqs = initial_states.shape[0]
+            elif seq_chunk_cumsum is not None:
+                inferred_num_seqs = seq_chunk_cumsum.numel() - 1
+            if num_seqs is None:
+                num_seqs = inferred_num_seqs
+            if num_seqs is None:
                 raise ValueError(
-                    "initial_states must be provided in varlen mode (when seq_idx, "
-                    "chunk_indices, and chunk_offsets are given) to determine num_seqs"
+                    "num_seqs must be provided in varlen mode when initial_states "
+                    "and seq_chunk_cumsum do not provide it"
                 )
-            num_seqs = initial_states.shape[0]
+            if not isinstance(num_seqs, int) or num_seqs <= 0:
+                raise ValueError(f"num_seqs must be a positive int, got {num_seqs}")
+            if inferred_num_seqs is not None and inferred_num_seqs != num_seqs:
+                raise ValueError(
+                    f"num_seqs ({num_seqs}) does not match inferred count "
+                    f"({inferred_num_seqs})"
+                )
+            if (
+                seq_chunk_cumsum is not None
+                and seq_chunk_cumsum.numel() != num_seqs + 1
+            ):
+                raise ValueError(
+                    "seq_chunk_cumsum must have num_seqs + 1 entries, got "
+                    f"{seq_chunk_cumsum.numel()} for num_seqs={num_seqs}"
+                )
+            kernel_num_seqs = num_seqs
             if seq_chunk_cumsum is None or update_seq_chunk_cumsum:
                 seq_chunk_cumsum = self.compute_seq_chunk_cumsum(
                     seq_idx,
@@ -674,36 +898,169 @@ class SSDCombined:
                     num_seqs,
                     seq_chunk_cumsum,
                 )
+        elif num_seqs is not None and num_seqs != batch:
+            raise ValueError(
+                f"num_seqs is only meaningful in varlen mode (expected {batch}, "
+                f"got {num_seqs})"
+            )
+
+        fstate_batch = kernel_num_seqs if has_varlen_metadata else batch
+        write_final_states = return_final_states or final_states is not None
+        if final_states is not None:
+            expected_fstate_shape = (
+                fstate_batch,
+                nheads,
+                headdim,
+                dstate,
+            )
+            if final_states.shape != expected_fstate_shape:
+                raise ValueError(
+                    f"final_states shape {final_states.shape} doesn't match "
+                    f"expected {expected_fstate_shape}"
+                )
+            if final_states.dtype != self._state_torch_dtype:
+                raise ValueError(
+                    f"final_states dtype {final_states.dtype} doesn't match "
+                    f"state dtype {self._state_torch_dtype}"
+                )
+            if not final_states.is_contiguous():
+                raise ValueError("final_states must be contiguous")
+            if final_states.data_ptr() % 16 != 0:
+                raise ValueError(
+                    "final_states data pointer must be 16-byte aligned for TMA stores"
+                )
+            if final_states.device != x.device:
+                raise ValueError("final_states must be on the same device as x")
+            fstate_torch = final_states
+        else:
+            # A one-row descriptor is sufficient when final stores are disabled.
+            fstate_torch = self._get_or_alloc_fstate(
+                fstate_batch if write_final_states else 1
+            )
+        fstate_permuted = fstate_torch.permute(3, 2, 1, 0)
+
+        intermediate_states_permuted = None
+        num_intermediate_state_slots = 0
+        if self._has_intermediate_states:
+            if intermediate_state_indices is None or intermediate_states is None:
+                raise ValueError(
+                    "intermediate_state_indices and intermediate_states are required "
+                    "when has_intermediate_states=True"
+                )
+            if intermediate_state_indices.dim() != 1:
+                raise ValueError("intermediate_state_indices must be 1D")
+            if intermediate_state_indices.dtype != torch.int32:
+                raise ValueError("intermediate_state_indices must have dtype int32")
+            if not intermediate_state_indices.is_contiguous():
+                raise ValueError("intermediate_state_indices must be contiguous")
+            if intermediate_state_indices.device != x.device:
+                raise ValueError(
+                    "intermediate_state_indices must be on the same device as x"
+                )
+            expected_state_tail = (nheads, headdim, dstate)
+            if (
+                intermediate_states.dim() != 4
+                or tuple(intermediate_states.shape[1:]) != expected_state_tail
+            ):
+                raise ValueError(
+                    "intermediate_states must have shape "
+                    f"(num_slots, {nheads}, {headdim}, {dstate}), got "
+                    f"{tuple(intermediate_states.shape)}"
+                )
+            if intermediate_states.dtype != self._state_torch_dtype:
+                raise ValueError(
+                    f"intermediate_states dtype {intermediate_states.dtype} doesn't "
+                    f"match state dtype {self._state_torch_dtype}"
+                )
+            if intermediate_states.data_ptr() % 16 != 0:
+                raise ValueError(
+                    "intermediate_states data pointer must be 16-byte aligned for "
+                    "TMA stores"
+                )
+            expected_inner_strides = (headdim * dstate, dstate, 1)
+            if tuple(intermediate_states.stride()[1:]) != expected_inner_strides:
+                raise ValueError(
+                    "intermediate_states inner dimensions must be compact with "
+                    f"strides {expected_inner_strides}, got "
+                    f"{tuple(intermediate_states.stride()[1:])}"
+                )
+            compact_row_size = nheads * headdim * dstate
+            if intermediate_states.stride(0) < compact_row_size:
+                raise ValueError(
+                    "intermediate_states row stride must be at least the logical "
+                    f"row size ({compact_row_size}), got "
+                    f"{intermediate_states.stride(0)}"
+                )
+            row_stride_bytes = (
+                intermediate_states.stride(0) * intermediate_states.element_size()
+            )
+            if row_stride_bytes % 16 != 0:
+                raise ValueError(
+                    "intermediate_states row stride must be 16-byte aligned for "
+                    f"TMA stores, got {row_stride_bytes} bytes"
+                )
+            if intermediate_states.device != x.device:
+                raise ValueError("intermediate_states must be on the same device as x")
+            num_intermediate_state_slots = intermediate_states.shape[0]
+            if num_intermediate_state_slots <= 0:
+                raise ValueError("intermediate_states must have at least one row")
+            intermediate_states_permuted = intermediate_states.permute(3, 2, 1, 0)
+        elif intermediate_state_indices is not None or intermediate_states is not None:
+            raise ValueError(
+                "construct SSDCombined with has_intermediate_states=True to request "
+                "selected state stores"
+            )
 
         num_logical_chunks = (
             len(chunk_indices) if chunk_indices is not None else nchunks
         )
+        if (
+            intermediate_state_indices is not None
+            and len(intermediate_state_indices) != num_logical_chunks
+        ):
+            raise ValueError(
+                "intermediate_state_indices must have one entry per logical segment "
+                f"({num_logical_chunks}), got {len(intermediate_state_indices)}"
+            )
 
-        self._compiled_kernel(
-            x_permuted,
-            cumsum_delta_permuted,
-            delta_permuted,
-            b_permuted,
-            c_permuted,
-            y_permuted,
-            init_states_permuted,
-            fstate_permuted,
-            d_tensor,
-            z_permuted,
-            seq_idx,
-            chunk_indices,
-            chunk_offsets,
-            seq_chunk_cumsum,
-            Int32(num_logical_chunks),
-            Int32(num_seqs),
-        )
+        # The CuTe kernel resolves its launch stream through TVM-FFI.  Bind
+        # that environment stream to PyTorch's current stream so preceding
+        # Triton work, the CuTe launch, and following PyTorch consumers remain
+        # correctly ordered on non-default serving streams.
+        with tvm_ffi.use_torch_stream():
+            self._compiled_kernel(
+                x_permuted,
+                cumsum_delta_permuted,
+                delta_permuted,
+                b_permuted,
+                c_permuted,
+                y_permuted,
+                init_states_permuted,
+                fstate_permuted,
+                intermediate_states_permuted,
+                intermediate_state_indices,
+                d_tensor,
+                z_permuted,
+                seq_idx,
+                chunk_indices,
+                chunk_offsets,
+                seq_chunk_cumsum,
+                Int32(num_logical_chunks),
+                Int32(kernel_num_seqs),
+                Int32(valid_seqlen),
+                Int32(num_intermediate_state_slots),
+                Int32(int(write_final_states)),
+            )
 
-        out_view = out.permute(0, 3, 4, 1, 2).reshape(
-            batch,
-            seqlen,
-            nheads,
-            headdim,
-        )
+        if self._output_token_major:
+            out_view = out[:, :valid_seqlen]
+        else:
+            out_view = out.permute(0, 3, 4, 1, 2).reshape(
+                batch,
+                seqlen,
+                nheads,
+                headdim,
+            )[:, :valid_seqlen]
         # fstate_torch is (B, EH, D, N) — already in the expected return layout
         fstate_out = fstate_torch if return_final_states else None
         return out_view, fstate_out

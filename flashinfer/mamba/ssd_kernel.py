@@ -60,14 +60,18 @@ class SSDKernel:
         has_init_states: bool,
         has_varlen: bool = False,
         has_z: bool = False,
+        has_intermediate_states: bool = False,
+        output_token_major: bool = False,
         io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
         state_dtype: Type[cutlass.Numeric] = None,
+        delta_dtype: Type[cutlass.Numeric] = None,
         seq_idx_dtype: Type[cutlass.Numeric] = cutlass.Int32,
         cumsum_delta_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
     ):
         self.io_dtype: Type[cutlass.Numeric] = io_dtype
         self.state_dtype: Type[cutlass.Numeric] = state_dtype or io_dtype
+        self.delta_dtype: Type[cutlass.Numeric] = delta_dtype or io_dtype
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.cumsum_delta_dtype: Type[cutlass.Numeric] = cumsum_delta_dtype
         self.seq_idx_dtype: Type[cutlass.Numeric] = seq_idx_dtype
@@ -75,6 +79,8 @@ class SSDKernel:
         self.has_d: bool = has_d
         self.has_init_states: bool = has_init_states
         self.has_varlen: bool = has_varlen
+        self.has_intermediate_states: bool = has_intermediate_states
+        self.output_token_major: bool = output_token_major
         # has_z means epilog warp applies z gating: y *= z * sigmoid(z)
         self.has_z: bool = has_z
         # d_has_hdim = True means D is (D, EH) shape and loaded by TMA
@@ -87,6 +93,9 @@ class SSDKernel:
             cutlass.BFloat16,
         }, "Do not support other I/O types."
         assert acc_dtype in {cutlass.Float32}, "Do not support other ACC types."
+        assert self.delta_dtype in {io_dtype, cutlass.Float32}, (
+            "Processed delta must use the I/O dtype or float32."
+        )
         assert cumsum_delta_dtype in {cutlass.Float32}, (
             "Do not support other cumsum types."
         )
@@ -335,7 +344,8 @@ class SSDKernel:
             (self.tile_shape_mnk_inter1[2], self.input_stages)
         )
         self.num_delta_load_bytes = cute.size_in_bytes(
-            self.io_dtype, cute.slice_(self.delta_linear_smem_layout, (None, 0))
+            self.delta_dtype,
+            cute.slice_(self.delta_linear_smem_layout, (None, 0)),
         )
 
         # Cumsum delta is linear smem layouts for pre/post processing
@@ -397,6 +407,8 @@ class SSDKernel:
         y: cute.Tensor,  # (L, D, C, EH, B) - L stride 1 (output)
         init_states: cute.Tensor,  # (D, N, EH, B) - D stride 1 (optional)
         fstate: cute.Tensor,  # (D, N, EH, B) - D stride 1 (output)
+        intermediate_states: cute.Tensor,  # (D, N, EH, S) - optional output
+        intermediate_state_indices: cute.Tensor,  # (num_logical_chunks,) int32
         d: cute.Tensor,  # (D, EH) or (1, EH) (optional)
         z: cute.Tensor,  # (D, L, C, EH, B) - D stride 1 (optional, for z gating)
         seq_idx: cute.Tensor,  # (batch, seqlen) int32 (optional)
@@ -405,6 +417,9 @@ class SSDKernel:
         seq_chunk_cumsum: cute.Tensor,  # (num_seqs+1,) int32 (optional, varlen only)
         num_logical_chunks: cutlass.Int32,  # len(chunk_indices), or 0 if no varlen
         num_seqs: cutlass.Int32,  # number of sequences (0 if no varlen)
+        valid_seqlen: cutlass.Int32,  # real tokens in physically padded input
+        num_intermediate_state_slots: cutlass.Int32,
+        write_final_states: cutlass.Int32,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -560,6 +575,23 @@ class SSDKernel:
             p_cta_v_layout,
         )
 
+        tma_atom_intermediate_states = None
+        tma_tensor_intermediate_states = intermediate_states
+        if cutlass.const_expr(self.has_intermediate_states):
+            intermediate_state_cta_v_layout = cute.slice_(
+                cute.make_identity_layout(intermediate_states.shape),
+                (None, None, 0, 0),
+            )
+            (
+                tma_atom_intermediate_states,
+                tma_tensor_intermediate_states,
+            ) = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(),
+                intermediate_states,
+                p_smem_layout_store,
+                intermediate_state_cta_v_layout,
+            )
+
         # Compute grid size
         tile_sched_params, grid = self._compute_grid(
             y, b, max_active_clusters, num_seqs
@@ -645,7 +677,7 @@ class SSDKernel:
             ]
             smem_delta: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.io_dtype, cute.cosize(self.delta_linear_smem_layout)
+                    self.delta_dtype, cute.cosize(self.delta_linear_smem_layout)
                 ],
                 nonswizzle_buffer_align_bytes,
             ]
@@ -673,6 +705,8 @@ class SSDKernel:
             tma_tensor_c,
             tma_atom_p,
             tma_tensor_p,
+            tma_atom_intermediate_states,
+            tma_tensor_intermediate_states,
             tma_atom_y,
             tma_tensor_y,
             y,
@@ -689,8 +723,12 @@ class SSDKernel:
             chunk_indices,
             chunk_offsets,
             seq_chunk_cumsum,
+            intermediate_state_indices,
             num_logical_chunks,
             num_seqs,
+            valid_seqlen,
+            num_intermediate_state_slots,
+            write_final_states,
             self.cluster_layout_vmnk,
             self.x_smem_layout,
             self.xt_smem_layout,
@@ -730,6 +768,8 @@ class SSDKernel:
         tma_tensor_c: cute.Tensor,
         tma_atom_p: cute.CopyAtom,
         tma_tensor_p: cute.Tensor,
+        tma_atom_intermediate_states: Optional[cute.CopyAtom],
+        tma_tensor_intermediate_states: cute.Tensor,
         tma_atom_y: cute.CopyAtom,
         tma_tensor_y: cute.Tensor,
         y_gmem: cute.Tensor,  # (L, D, C, EH, B) raw gmem tensor for masked store
@@ -746,8 +786,12 @@ class SSDKernel:
         chunk_indices: cute.Tensor,  # (num_logical_chunks,) int32 or None
         chunk_offsets: cute.Tensor,  # (num_logical_chunks,) int32 or None
         seq_chunk_cumsum: cute.Tensor,  # (num_seqs+1,) int32 or None
+        intermediate_state_indices: cute.Tensor,  # logical segment -> cache row
         num_logical_chunks: cutlass.Int32,  # len(chunk_indices), or 0 if no varlen
         num_seqs: cutlass.Int32,  # number of sequences (0 if no varlen)
+        valid_seqlen: cutlass.Int32,
+        num_intermediate_state_slots: cutlass.Int32,
+        write_final_states: cutlass.Int32,
         cluster_layout_vmnk: cute.Layout,
         x_smem_layout: cute.ComposedLayout,
         xt_smem_layout: cute.ComposedLayout,
@@ -783,6 +827,8 @@ class SSDKernel:
             ]
             if cutlass.const_expr(self.d_has_hdim):
                 tma_atoms.append(tma_atom_d)
+            if cutlass.const_expr(self.has_intermediate_states):
+                tma_atoms.append(tma_atom_intermediate_states)
             for tma_atom in tma_atoms:
                 cpasync.prefetch_descriptor(tma_atom)
 
@@ -1082,6 +1128,8 @@ class SSDKernel:
                 tiled_mma_inter2,
                 tma_atom_p,
                 tma_tensor_p,
+                tma_atom_intermediate_states,
+                tma_tensor_intermediate_states,
                 b_pipeline,
                 deltas_pipeline,
                 inter1_b_pipeline,
@@ -1096,7 +1144,11 @@ class SSDKernel:
                 chunk_indices,
                 chunk_offsets,
                 seq_chunk_cumsum,
+                intermediate_state_indices,
                 num_logical_chunks,
+                valid_seqlen,
+                num_intermediate_state_slots,
+                write_final_states,
             )
 
         # Specialized Pre-Intra warp
@@ -1126,6 +1178,7 @@ class SSDKernel:
                 chunk_offsets,
                 seq_chunk_cumsum,
                 num_logical_chunks,
+                valid_seqlen,
             )
 
         # Specialized Epilogue warp
@@ -1160,6 +1213,7 @@ class SSDKernel:
                 chunk_offsets,
                 seq_chunk_cumsum,
                 num_logical_chunks,
+                valid_seqlen,
             )
 
         # Dealloc tmem buffer
@@ -1201,6 +1255,8 @@ class SSDKernel:
         tiled_mma_inter2,
         tma_atom_p,
         tma_tensor_p,
+        tma_atom_intermediate_states,
+        tma_tensor_intermediate_states,
         b_pipeline,
         deltas_pipeline,
         inter1_b_pipeline,
@@ -1215,7 +1271,11 @@ class SSDKernel:
         chunk_indices,
         chunk_offsets,
         seq_chunk_cumsum,
+        intermediate_state_indices,
         num_logical_chunks,
+        valid_seqlen,
+        num_intermediate_state_slots,
+        write_final_states,
     ):
         # Make tiledCopy and partition smem/register tensor for smem load Bt
         # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N, INPUT_STAGE)
@@ -1339,6 +1399,21 @@ class SSDKernel:
                 self.tile_shape_mnk_inter2[1],
             ),  # (N, D) to match gmem
         )
+        bSG_sIntermediate = None
+        bSG_gIntermediate_pre_slice = None
+        if cutlass.const_expr(self.has_intermediate_states):
+            (
+                bSG_sIntermediate,
+                bSG_gIntermediate_pre_slice,
+            ) = self.tma_partition_with_shape(
+                tma_atom_intermediate_states,
+                tma_tensor_intermediate_states,
+                smem_p_store,
+                (
+                    self.tile_shape_mnk_inter2[2],
+                    self.tile_shape_mnk_inter2[1],
+                ),
+            )
 
         # Pipeline B/Delta/INTER1_ACC consumer state
         b_consumer_state = pipeline.make_pipeline_state(
@@ -1474,9 +1549,21 @@ class SSDKernel:
                     chunk_indices,
                     chunk_offsets,
                     L,
+                    valid_seqlen,
                 )
                 if cutlass.const_expr(self.has_varlen):
-                    if chunk_size_limit < L:
+                    # A logical boundary inside a physical chunk needs its own
+                    # endpoint. A globally padded final chunk does not: the
+                    # cumsum kernel zero-masks that tail, so slot L - 1 repeats
+                    # the valid endpoint exactly as the reference chunk-state
+                    # kernel consumes it.
+                    valid_chunk_limit = valid_seqlen - chunk * L
+                    if valid_chunk_limit > L:
+                        valid_chunk_limit = L
+                    if (
+                        chunk_size_limit < L
+                        and chunk_size_limit < valid_chunk_limit
+                    ):
                         last_column = smem_cumsum_delta[
                             chunk_size_limit - 1,
                             deltas_consumer_state.index,
@@ -1562,7 +1649,16 @@ class SSDKernel:
 
                 # Store scaled P to tRS_rP_io
                 for reg_idx in range(cute.size(tTR_rP)):
-                    tRS_rP_io[reg_idx] = tTR_rP[reg_idx].to(self.io_dtype)
+                    # Match the decomposed serving contract: state passing
+                    # keeps the recurrence accumulator in FP32, stores each
+                    # chunk boundary in state_dtype, and chunk scan reloads
+                    # that checkpoint before converting it to the model I/O
+                    # dtype for the inter2 MMA.  A direct FP32 -> BF16 cast is
+                    # not equivalent to FP32 -> FP16 -> BF16 when vLLM uses an
+                    # FP16 SSM cache, and the difference compounds across
+                    # Mamba layers even though final states remain close.
+                    stored_state = tTR_rP[reg_idx].to(self.state_dtype)
+                    tRS_rP_io[reg_idx] = stored_state.to(self.io_dtype)
 
                 # Update old state
                 tState.store(tTR_rP.load())
@@ -1580,6 +1676,69 @@ class SSDKernel:
                 # Async arrive INTER1_ACC buffer empty
                 inter1_acc_pipeline.consumer_release(inter1_acc_consumer_state)
 
+                # Optionally persist this post-logical-segment state directly
+                # into a caller-owned cache row.  The mapping is sparse and may
+                # address a destination tensor larger than the number of
+                # selected segments.  Bounds checks prevent an invalid mapping
+                # from becoming an out-of-bounds global store.
+                if cutlass.const_expr(self.has_intermediate_states):
+                    state_slot = intermediate_state_indices[physical_chunk]
+                    if (
+                        state_slot >= 0
+                        and state_slot < num_intermediate_state_slots
+                    ):
+                        for reg_idx in range(cute.size(tState)):
+                            tRS_rP_state[reg_idx] = tState[reg_idx].to(
+                                self.state_dtype
+                            )
+                        cute.copy(
+                            tiled_r2s_p_state,
+                            tRS_rP_state,
+                            tRS_sP_state[inter2_p_coord],
+                        )
+                        cute.arch.fence_proxy(
+                            "async.shared",
+                            space="cta",
+                        )
+                        cute.arch.barrier(
+                            barrier_id=self.pre_inter_sync_bar_id,
+                            number_of_threads=len(self.pre_inter_warp_id) * 32,
+                        )
+                        if local_warp_idx == 0:
+                            bSG_gIntermediate = bSG_gIntermediate_pre_slice[
+                                (None, 0, 0, eh_idx, state_slot)
+                            ]
+                            cute.copy(
+                                tma_atom_intermediate_states,
+                                bSG_sIntermediate[
+                                    (None, inter2_p_producer_state.index)
+                                ],
+                                bSG_gIntermediate,
+                            )
+                            # TMA commit/wait state is warp-local.  The issuing
+                            # warp must wait for the SMEM read to finish before
+                            # the other pre-inter warps restore their slices.
+                            tma_p_pipeline.producer_commit()
+                            tma_p_pipeline.producer_acquire()
+                        cute.arch.barrier(
+                            barrier_id=self.pre_inter_sync_bar_id,
+                            number_of_threads=len(self.pre_inter_warp_id) * 32,
+                        )
+
+                        # The same shared-memory storage backs the BF16 inter2
+                        # operand and the FP16/BF16 state store.  Restore the IO
+                        # representation so FP16 state output cannot corrupt the
+                        # next segment's recurrent input.
+                        cute.copy(
+                            tiled_r2s_p_io,
+                            tRS_rP_io,
+                            tRS_sP_io[inter2_p_coord],
+                        )
+                        cute.arch.fence_proxy(
+                            "async.shared",
+                            space="cta",
+                        )
+
                 # --- Varlen look-ahead: store fstate / reload init_state ---
                 if cutlass.const_expr(self.has_init_states and self.has_varlen):
                     is_last_chunk = chunk_idx == C - 1
@@ -1594,7 +1753,7 @@ class SSDKernel:
                         seq_ends_here = next_seq != seq_id
 
                     # A. Store final state of ending sequence to gmem
-                    if seq_ends_here:
+                    if seq_ends_here and write_final_states != 0:
                         # Convert smem_p from io_dtype to state_dtype for TMA store
                         for reg_idx in range(cute.size(tState)):
                             tRS_rP_state[reg_idx] = tState[reg_idx].to(self.state_dtype)
@@ -1671,43 +1830,47 @@ class SSDKernel:
                     # Advance INTER2_P producer state
                     inter2_p_producer_state.advance()
 
-            # Convert smem_p from io_dtype to state_dtype for final TMA store
-            for reg_idx in range(cute.size(tState)):
-                tRS_rP_state[reg_idx] = tState[reg_idx].to(self.state_dtype)
-            cute.copy(
-                tiled_r2s_p_state,
-                tRS_rP_state,
-                tRS_sP_state[inter2_p_coord],
-            )
-
-            # Store last INTER2_P (State) from smem to gmem
-            cute.arch.fence_proxy(
-                "async.shared",
-                space="cta",
-            )
-            cute.arch.barrier(
-                barrier_id=self.pre_inter_sync_bar_id,
-                number_of_threads=len(self.pre_inter_warp_id) * 32,
-            )
-
-            if local_warp_idx == 0:
-                # TMA store fstate (state_dtype)
-                if cutlass.const_expr(self.has_init_states and self.has_varlen):
-                    bSG_gP_final = bSG_gP_pre_slice[(None, 0, 0, eh_idx, seq_id)]
-                else:
-                    bSG_gP_final = bSG_gP
+            if write_final_states != 0:
+                # Convert smem_p from io_dtype to state_dtype for final TMA store
+                for reg_idx in range(cute.size(tState)):
+                    tRS_rP_state[reg_idx] = tState[reg_idx].to(self.state_dtype)
                 cute.copy(
-                    tma_atom_p,
-                    bSG_sP[(None, inter2_p_producer_state.index)],
-                    bSG_gP_final,
+                    tiled_r2s_p_state,
+                    tRS_rP_state,
+                    tRS_sP_state[inter2_p_coord],
                 )
-                tma_p_pipeline.producer_commit()
-                tma_p_pipeline.producer_acquire()
 
-            cute.arch.barrier(
-                barrier_id=self.pre_inter_sync_bar_id,
-                number_of_threads=len(self.pre_inter_warp_id) * 32,
-            )
+                # Store last INTER2_P (State) from smem to gmem
+                cute.arch.fence_proxy(
+                    "async.shared",
+                    space="cta",
+                )
+                cute.arch.barrier(
+                    barrier_id=self.pre_inter_sync_bar_id,
+                    number_of_threads=len(self.pre_inter_warp_id) * 32,
+                )
+
+                if local_warp_idx == 0:
+                    # In varlen mode the scheduler's batch coordinate is a
+                    # sequence id even when no initial states were supplied.
+                    if cutlass.const_expr(self.has_varlen):
+                        bSG_gP_final = bSG_gP_pre_slice[
+                            (None, 0, 0, eh_idx, seq_id)
+                        ]
+                    else:
+                        bSG_gP_final = bSG_gP
+                    cute.copy(
+                        tma_atom_p,
+                        bSG_sP[(None, inter2_p_producer_state.index)],
+                        bSG_gP_final,
+                    )
+                    tma_p_pipeline.producer_commit()
+                    tma_p_pipeline.producer_acquire()
+
+                cute.arch.barrier(
+                    barrier_id=self.pre_inter_sync_bar_id,
+                    number_of_threads=len(self.pre_inter_warp_id) * 32,
+                )
             tma_p_pipeline.producer_tail()
 
             # release init_state_pipeline for the next tile
@@ -1754,6 +1917,7 @@ class SSDKernel:
         chunk_offsets,
         seq_chunk_cumsum,
         num_logical_chunks,
+        valid_seqlen,
     ):
         # (L, D, INPUT_STAGE)
         sDeltaA = self.epilog_make_delta(smem_cumsum_delta)
@@ -1930,6 +2094,7 @@ class SSDKernel:
                     chunk_indices,
                     chunk_offsets,
                     L,
+                    valid_seqlen,
                 )
 
                 # Conditionally wait for Delta/INTRA2_ACC/INTER2_ACC/X buffer full
@@ -2118,7 +2283,9 @@ class SSDKernel:
                         l_coord = 0
                         d_coord = 0
                         d_off = epi_n * epi_tile[1]
-                        if chunk_size_limit < L or chunk_offset > 0:
+                        if cutlass.const_expr(self.output_token_major) or (
+                            chunk_size_limit < L or chunk_offset > 0
+                        ):
                             for reg_idx in cutlass.range(
                                 cute.size(tRS_rY), unroll_full=True
                             ):
@@ -2205,6 +2372,7 @@ class SSDKernel:
         chunk_offsets,
         seq_chunk_cumsum,
         num_logical_chunks,
+        valid_seqlen,
     ):
         # Make tmem fragment for INTRA1_ACC
         # (MMA, MMA_M, MMA_N, INTRA1_ACC_STAGE)
@@ -2335,6 +2503,7 @@ class SSDKernel:
                     chunk_indices,
                     chunk_offsets,
                     L,
+                    valid_seqlen,
                 )
 
                 # Load Q from tmem
@@ -3859,7 +4028,14 @@ class SSDKernel:
 
     @cute.jit
     def compute_chunk_size_limit(
-        self, physical_chunk, chunk, num_logical_chunks, chunk_indices, chunk_offsets, L
+        self,
+        physical_chunk,
+        chunk,
+        num_logical_chunks,
+        chunk_indices,
+        chunk_offsets,
+        L,
+        valid_seqlen,
     ):
         """Compute how far into the physical chunk this logical chunk extends.
 
@@ -3873,6 +4049,12 @@ class SSDKernel:
                 next_chunk = chunk_indices[physical_chunk + 1]
                 if next_chunk == chunk:
                     chunk_size_limit = chunk_offsets[physical_chunk + 1]
+            # The physical input is chunk aligned, but packed serving batches
+            # commonly end in a partially filled final chunk.  Clamp every
+            # path that consumes this logical segment to the real token tail.
+            valid_chunk_limit = valid_seqlen - chunk * L
+            if valid_chunk_limit < chunk_size_limit:
+                chunk_size_limit = valid_chunk_limit
         return chunk_size_limit
 
     def pre_intra_tmem_load_and_partition_q(self, tIntra1, local_tidx):
@@ -3981,14 +4163,14 @@ class SSDKernel:
                     cute.math.exp2(tCompute_log2e[0], fastmath=True),
                     cute.math.exp2(tCompute_log2e[1], fastmath=True),
                 ),
-                (tCrDelta[subtile_idx], tCrDelta[subtile_idx + 1]),
+                (tTR_rQ[subtile_idx], tTR_rQ[subtile_idx + 1]),
             )
             (
                 tCompute[subtile_idx],
                 tCompute[subtile_idx + 1],
             ) = cute.arch.mul_packed_f32x2(
                 (tCompute[subtile_idx], tCompute[subtile_idx + 1]),
-                (tTR_rQ[subtile_idx], tTR_rQ[subtile_idx + 1]),
+                (tCrDelta[subtile_idx], tCrDelta[subtile_idx + 1]),
             )
 
         tRT_rQ.store(tCompute.load().to(self.io_dtype))

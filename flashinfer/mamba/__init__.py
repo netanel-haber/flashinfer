@@ -20,8 +20,8 @@ from .checkpointing_ssu import checkpointing_ssu
 __all__ = ["selective_state_update", "checkpointing_ssu"]
 
 try:
-    from .ssd_combined import SSDCombined
+    from .ssd_combined import SSDCombined, SSD_COMBINED_VARLEN_STATE_API_VERSION
 
-    __all__.append("SSDCombined")
+    __all__.extend(["SSDCombined", "SSD_COMBINED_VARLEN_STATE_API_VERSION"])
 except ImportError:
     pass

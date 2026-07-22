@@ -158,6 +158,8 @@ def chunk_cumsum_fwd(
     dt_softplus: bool = False,
     dt_limit: tuple = (0.0, float("inf")),
     dt_out_dtype: torch.dtype = torch.float32,
+    valid_seqlen: int | None = None,
+    cumsum_block_size_h: int | None = None,
 ):
     """
     Compute the cumulative sum of dA for SSD (Structured State-Space Duality).
@@ -180,6 +182,16 @@ def chunk_cumsum_fwd(
         Whether to apply softplus to dt
     dt_limit : tuple
         (min, max) limits for dt values after processing
+    valid_seqlen : int, optional
+        Number of logical tokens in a physically padded input. Values beyond
+        this point are masked after bias/softplus, matching the reference SSD
+        cumsum semantics. The same logical length is used for every batch row;
+        partially padded serving inputs therefore require ``batch == 1``.
+    cumsum_block_size_h : int, optional
+        Fixed head tile for the Triton scan. By default the legacy autotuner
+        selects from ``1, 2, 4, 8, 16, 32, 64``. Serving integrations that
+        compare against another SSD implementation may provide the same tile
+        explicitly to keep the floating-point reduction tree deterministic.
 
     Returns
     -------
@@ -189,6 +201,25 @@ def chunk_cumsum_fwd(
         Processed dt with shape (batch, nheads, nchunks, chunk_size)
     """
     batch, seqlen, nheads = dt.shape
+    if valid_seqlen is None:
+        valid_seqlen = seqlen
+    if not isinstance(valid_seqlen, int):
+        raise TypeError(f"valid_seqlen must be an int, got {type(valid_seqlen)}")
+    if valid_seqlen <= 0 or valid_seqlen > seqlen:
+        raise ValueError(
+            f"valid_seqlen must be in [1, {seqlen}], got {valid_seqlen}"
+        )
+    if valid_seqlen != seqlen and batch != 1:
+        raise ValueError("partially padded cumsum currently requires batch=1")
+    supported_block_sizes = (1, 2, 4, 8, 16, 32, 64)
+    if cumsum_block_size_h is not None and (
+        type(cumsum_block_size_h) is not int
+        or cumsum_block_size_h not in supported_block_sizes
+    ):
+        raise ValueError(
+            "cumsum_block_size_h must be one of "
+            f"{supported_block_sizes}, got {cumsum_block_size_h}"
+        )
     assert A.shape == (nheads,)
     if dt_bias is not None:
         assert dt_bias.shape == (nheads,)
@@ -199,20 +230,37 @@ def chunk_cumsum_fwd(
     dA_cumsum = torch.empty(
         batch, nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32
     )
-    grid_chunk_cs = lambda META: (
-        batch,
-        nchunks,
-        triton.cdiv(nheads, META["BLOCK_SIZE_H"]),
-    )
+    if cumsum_block_size_h is None:
+        kernel = _chunk_cumsum_fwd_kernel
+        grid_chunk_cs = lambda META: (
+            batch,
+            nchunks,
+            triton.cdiv(nheads, META["BLOCK_SIZE_H"]),
+        )
+        fixed_launch_options = {}
+    else:
+        # Bypass only the autotuner; use the exact same JIT kernel body.
+        kernel = _chunk_cumsum_fwd_kernel.fn
+        grid_chunk_cs = (
+            batch,
+            nchunks,
+            triton.cdiv(nheads, cumsum_block_size_h),
+        )
+        fixed_launch_options = {
+            "BLOCK_SIZE_H": cumsum_block_size_h,
+            "num_warps": 4,
+            "num_stages": 3,
+            "num_ctas": 1,
+        }
     with torch.cuda.device(dt.device.index):
-        _chunk_cumsum_fwd_kernel[grid_chunk_cs](
+        kernel[grid_chunk_cs](
             dt,
             A,
             dt_bias,
             dt_out,
             dA_cumsum,
             batch,
-            seqlen,
+            valid_seqlen,
             nheads,
             chunk_size,
             dt_limit[0],
@@ -233,5 +281,6 @@ def chunk_cumsum_fwd(
             dt_softplus,
             HAS_DT_BIAS=dt_bias is not None,
             BLOCK_SIZE_CHUNK=triton.next_power_of_2(chunk_size),
+            **fixed_launch_options,
         )
     return dA_cumsum, dt_out
